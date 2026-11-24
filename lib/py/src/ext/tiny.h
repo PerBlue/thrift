@@ -27,11 +27,11 @@
 #include <stack>
 #include <vector>
 #include <map>
-#include <locale>
-#include <codecvt>
 #include <string>
+#if PY_MAJOR_VERSION < 3
 #include <cStringIO.h>
 #include <stringobject.h>
+#endif
 
 namespace apache {
 namespace thrift {
@@ -128,44 +128,61 @@ public:
   		uint32_t stringCount = stringList_.size();
     	writeVarint(stringCount);
         uint32_t rewrittenStrings = 0;
-        
-        std::wstring_convert<std::codecvt_utf8<wchar_t> > utfconv;
-        
+
     	for(uint32_t i=0; i < stringCount; ++i)
     	{
-    		char* cstr = (char*)stringList_[i].c_str();
-            uint32_t size = stringList_[i].size();
-            
-            //Replace rewritable strings
-            if (size > 2 && cstr[0] == 0x1B && cstr[1] == 0x1A)
+    		const std::string& str = stringList_[i];
+
+            // Replace rewritable strings (prefix ESC SUB) with an id.
+            // Must match TTinyProtocol.py: id counts from 1 and is written
+            // as base64 of the id as 4 little-endian bytes.
+            if (str.size() >= 2 && str[0] == 0x1B && str[1] == 0x1A)
             {
                 rewrittenStrings += 1;
-                //Encode int to short unicode
-                uint32_t enc = rewrittenStrings;
-                std::wstring indexed = L"";
-                do
-                {
-                    indexed += wchar_t(enc & 0xffff);
-                    enc = enc >> 16;
-                } while (enc > 0);
-                
-                std::string encoded = utfconv.to_bytes(indexed);
-                cstr = (char*)encoded.c_str();
-                size = encoded.size();
+                std::string encoded = encodeRewrittenId(rewrittenStrings);
+                writeVarint(encoded.size());
+                writeBuffer((char*)encoded.data(), encoded.size());
             }
-            writeVarint(size);
-            writeBuffer(cstr, size);
+            else
+            {
+                writeVarint(str.size());
+                writeBuffer((char*)str.data(), str.size());
+            }
     	}
+#if PY_MAJOR_VERSION < 3
     	PyObject* bufferedString = PycStringIO->cgetvalue(buffered);
 		size_t bufferedSize = PyString_Size(bufferedString);
 		char* bufferedData = PyString_AsString(bufferedString);
     	writeBuffer(bufferedData, bufferedSize);
 		Py_CLEAR(bufferedString);
 		Py_CLEAR(buffered);
+#else
+    	writeBuffer(buffered->buf.data(), buffered->buf.size());
+    	delete buffered;
+#endif
 		buffered = NULL;
   	}
 #endif
     return true;
+  }
+
+  static std::string encodeRewrittenId(uint32_t id) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    unsigned char b[4] = {
+      static_cast<unsigned char>(id & 0xff),
+      static_cast<unsigned char>((id >> 8) & 0xff),
+      static_cast<unsigned char>((id >> 16) & 0xff),
+      static_cast<unsigned char>((id >> 24) & 0xff),
+    };
+    std::string out;
+    out += table[b[0] >> 2];
+    out += table[((b[0] & 0x03) << 4) | (b[1] >> 4)];
+    out += table[((b[1] & 0x0f) << 2) | (b[2] >> 6)];
+    out += table[b[2] & 0x3f];
+    out += table[b[3] >> 2];
+    out += table[(b[3] & 0x03) << 4];
+    out += "==";
+    return out;
   }
 
   bool writeField(PyObject* value, const StructItemSpec& spec) {
@@ -250,9 +267,14 @@ public:
 	uint32_t slot;
 	if (!readVarint<uint32_t, 5>(slot))
 		return -1;
-	std::string str = stringList_[slot];
-	*buf = (char*)str.c_str();
-	return str.length();
+	if (slot >= stringList_.size()) {
+		PyErr_Format(PyExc_IndexError, "tiny string slot %u out of range (%u strings)",
+		             slot, static_cast<uint32_t>(stringList_.size()));
+		return -1;
+	}
+	const std::string& str = stringList_[slot];
+	*buf = (char*)str.data();
+	return static_cast<int32_t>(str.size());
 #else
     uint32_t len;
     if (!readVarint<uint32_t, 5>(len) || !checkLengthLimit(len, stringLimit())) {
@@ -310,6 +332,7 @@ public:
 #ifndef N3TWORK_ADDITIONS
   	if(readTags_.empty())
   	{
+  		stringList_.clear();
   		uint32_t stringCount;
   		if (!readVarint<uint32_t, 5>(stringCount))
   			return false;
@@ -325,7 +348,7 @@ public:
 				if (!readBytes(&buf, len)) {
 				  return false;
 				}
-				str = buf;
+				str.assign(buf, len);
 			}
 			stringList_.push_back(str);
 		}
@@ -336,9 +359,6 @@ public:
   }
   bool readStructEnd() {
     readTags_.pop();
-#ifndef N3TWORK_ADDITIONS
-	stringList_.clear();
-#endif
     return true;
   }
   bool readFieldBegin(TType& type, int16_t& tag);
